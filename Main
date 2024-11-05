@@ -1,0 +1,545 @@
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from tkinter.scrolledtext import ScrolledText
+from tkinter import ttk
+import csv
+import logging
+import re
+import textwrap
+from collections import defaultdict
+from mlx_lm import load, generate
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Load the model and tokenizer
+model, tokenizer = load("mlx-community/Llama-3.2-3B-Instruct-4bit")
+
+def pretty_print_string(input_string, width=160):
+    """
+    Pretty print a string by wrapping it to a specified width and adding newlines.
+    """
+    wrapped_string = textwrap.fill(input_string, width)
+    print(wrapped_string)
+
+def string_to_csv(data_rows, output_filename, header):
+    """
+    Write data rows to a CSV file.
+    """
+    try:
+        with open(output_filename, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(header)
+            writer.writerows(data_rows)
+        logger.info(f"CSV file '{output_filename}' created successfully.")
+    except Exception as e:
+        logger.error(f"Failed to write to CSV file '{output_filename}': {e}")
+
+def call_llm(prompt, system_message=None):
+    """
+    Call the LLM with the given prompt and system message.
+    """
+    try:
+        # Prepare the messages
+        messages = []
+        if system_message:
+            messages.append({"role": "system", "content": system_message})
+        if prompt.strip():
+            messages.append({"role": "user", "content": prompt})
+
+        # Apply chat template if available
+        if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None:
+            prompt_text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        else:
+            # If no chat template, combine messages manually
+            prompt_text = ""
+            for message in messages:
+                role = message["role"]
+                content = message["content"]
+                prompt_text += f"{role}: {content}\n"
+            prompt_text += "assistant:"
+
+        # Generate response
+        response = generate(model, tokenizer, prompt=prompt_text, verbose=False)
+        logger.debug(f"LLM Response:\n{response}")
+        return response.strip()
+    except Exception as e:
+        logger.error(f"LLM call failed: {e}")
+        return ""
+
+def extract_info(narrative, system_message, default_role=None):
+    """
+    Extract information from the narrative using the LLM based on the system message.
+
+    Args:
+        narrative (str): The narrative text.
+        system_message (str): The prompt for the LLM.
+        default_role (str, optional): The role to assign if only one item is extracted per line.
+
+    Returns:
+        list: A list of [Info, Role] pairs.
+    """
+    response = call_llm(narrative, system_message=system_message)
+    logger.info(f"Model's raw response:\n{response}")
+    # Process the response into data rows
+    data_rows = []
+    lines = response.strip().split('\n')
+    for line in lines:
+        if not line.strip():
+            continue
+        # Split line by commas
+        parts = [part.strip().strip('"') for part in line.split(',') if part.strip()]
+        if len(parts) == 2:
+            data_rows.append(parts)
+        elif len(parts) == 1:
+            # Assign default role or 'Unknown' if not provided
+            data_rows.append([parts[0], default_role if default_role else "Unknown"])
+        else:
+            # Try to parse multiple entries in one line
+            parts = re.split(r';|,', line)
+            parts = [part.strip().strip('"') for part in parts if part.strip()]
+            if len(parts) == 2:
+                data_rows.append(parts)
+            else:
+                logger.warning(f"Unexpected line format: {line}")
+    return data_rows
+
+def assign_role_numbers(data_rows):
+    """
+    Assign numbers to each unique role in the data rows.
+    """
+    role_counts = defaultdict(int)
+    for row in data_rows:
+        role = row[1].strip()
+        role_counts[role] += 1
+        # Combine role and number without introducing commas
+        row[1] = f"{role} {role_counts[role]}"
+    return data_rows
+
+def clean_narrative(narrative):
+    """
+    Clean up the narrative by removing any extraneous text at the end.
+    """
+    # Remove any text after the last period
+    last_period = narrative.rfind('.')
+    if last_period != -1:
+        narrative = narrative[:last_period+1]
+    return narrative.strip()
+
+def create_spreadsheet(narrative, output_filename='output.csv'):
+    """
+    Creates a spreadsheet of names, roles, and locations extracted from the narrative.
+    """
+    # Clean up the narrative
+    narrative = clean_narrative(narrative)
+
+    # Extract names and roles
+    names_system_message = (
+        "Please read the following police report and extract all names along with their associated roles if available. "
+        "If a role is not specified, assign 'Unknown' as the role. "
+        "Format the output as 'Name, Role' with one entry per line. Do not include any extra text."
+    )
+    names_roles_data = extract_info(narrative, names_system_message)
+    logger.info("Extracted names and roles:")
+    logger.info(names_roles_data)
+
+    # Extract locations and add to data
+    locations_system_message = (
+        "Please extract all locations mentioned in the following police report. "
+        "Output each location on a separate line without any extra text."
+    )
+    location_data = extract_info(narrative, locations_system_message, default_role="Location")
+    logger.info("Extracted locations:")
+    logger.info(location_data)
+
+    # Combine data
+    all_data = names_roles_data + location_data
+
+    # Check if data is empty
+    if not all_data:
+        logger.error("No data extracted from narrative.")
+        return None
+
+    # Assign numbers to roles
+    all_data = assign_role_numbers(all_data)
+
+    # Write data to CSV
+    header = ['Info', 'Role']
+    string_to_csv(all_data, output_filename, header)
+    return header, all_data  # Return data for GUI display
+
+def save_narrative(narrative):
+    """
+    Save the narrative to defaultNarritive.txt.
+    """
+    try:
+        with open('defaultNarritive.txt', 'w', encoding='utf-8') as f:
+            f.write(narrative.strip())
+        messagebox.showinfo("Success", "Narrative saved to 'defaultNarritive.txt'.")
+    except Exception as e:
+        logger.error(f"Failed to save narrative: {e}")
+        messagebox.showerror("Error", "Failed to save narrative.")
+
+def create_spreadsheet_gui(narrative, csv_tree):
+    # Ask user where to save the CSV file
+    output_filename = filedialog.asksaveasfilename(defaultextension=".csv", title="Save CSV File", filetypes=[("CSV files", "*.csv")])
+    if not output_filename:
+        return
+    result = create_spreadsheet(narrative, output_filename)
+    if result:
+        header, data_rows = result
+        populate_csv_tree(csv_tree, header, data_rows)
+        messagebox.showinfo("Success", f"Named entity sheet saved as '{output_filename}'.")
+        csv_tree.filename = output_filename  # Store filename in treeview for saving
+    else:
+        messagebox.showerror("Error", "Failed to create named entity sheet. No data extracted.")
+
+def populate_csv_tree(tree, header, data):
+    """
+    Populate the Treeview widget with CSV data and make it editable.
+    """
+    # Clear existing data
+    tree.delete(*tree.get_children())
+    tree["columns"] = header
+    tree["show"] = "headings"
+    for col in header:
+        tree.heading(col, text=col)
+        tree.column(col, width=150)
+
+    # Define tag for new rows (dark grey)
+    tree.tag_configure('new_row', background='#A9A9A9')
+
+    # Insert data
+    for row in data:
+        tree.insert("", tk.END, values=row)
+
+    # Bind double-click event to edit cells
+    tree.bind("<Double-1>", lambda event: edit_cell(event, tree))
+
+def edit_cell(event, tree):
+    """
+    Edit the content of a cell in the Treeview.
+    """
+    region = tree.identify("region", event.x, event.y)
+    if region == "cell":
+        row_id = tree.identify_row(event.y)
+        column = tree.identify_column(event.x)
+        x, y, width, height = tree.bbox(row_id, column)
+        value = tree.set(row_id, column)
+
+        # Create an Entry widget for editing
+        entry = tk.Entry(tree)
+        entry.place(x=x, y=y, width=width, height=height)
+        entry.insert(0, value)
+        entry.focus_set()
+
+        def on_enter(event):
+            tree.set(row_id, column, entry.get())
+            entry.destroy()
+
+        def on_focus_out(event):
+            tree.set(row_id, column, entry.get())
+            entry.destroy()
+
+        entry.bind("<Return>", on_enter)
+        entry.bind("<FocusOut>", on_focus_out)
+
+def add_row(tree):
+    """
+    Add a new row to the Treeview and highlight it.
+    """
+    new_item = tree.insert("", tk.END, values=["", ""], tags=('new_row',))
+    # Ensure the new row is visible
+    tree.see(new_item)
+
+def delete_row(tree):
+    """
+    Delete the selected row from the Treeview.
+    """
+    selected_item = tree.selection()
+    if selected_item:
+        tree.delete(selected_item)
+    else:
+        messagebox.showwarning("Warning", "No row selected to delete.")
+
+def save_csv(tree):
+    """
+    Save the CSV data from the Treeview back to the file.
+    """
+    if hasattr(tree, 'filename'):
+        data = []
+        for item in tree.get_children():
+            data.append(tree.item(item)['values'])
+        try:
+            with open(tree.filename, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(tree["columns"])
+                writer.writerows(data)
+            messagebox.showinfo("Success", f"CSV saved to '{tree.filename}'.")
+        except Exception as e:
+            logger.error(f"Failed to save CSV: {e}")
+            messagebox.showerror("Error", "Failed to save CSV.")
+    else:
+        messagebox.showerror("Error", "No CSV file associated with the data.")
+
+def edit_spreadsheet_gui(narrative, csv_tree):
+    # Ask user to select the CSV file
+    csv_file = filedialog.askopenfilename(title="Select CSV File", filetypes=[("CSV files", "*.csv")])
+    if not csv_file:
+        return
+    # Ask user where to save the updated CSV file
+    output_filename = filedialog.asksaveasfilename(defaultextension=".csv", title="Save Updated CSV File", filetypes=[("CSV files", "*.csv")])
+    if not output_filename:
+        return
+    result = edit_spreadsheet(narrative, csv_file, output_filename)
+    if result:
+        header, data_rows = result
+        populate_csv_tree(csv_tree, header, data_rows)
+        messagebox.showinfo("Success", f"Spreadsheet '{csv_file}' has been updated and saved as '{output_filename}'.")
+        # Display the updated CSV in the Treeview
+        csv_tree.filename = output_filename  # Store filename in treeview for saving
+    else:
+        messagebox.showerror("Error", "Failed to edit spreadsheet.")
+
+def edit_spreadsheet(narrative, input_filename, output_filename='output_edited.csv'):
+    """
+    Edit the spreadsheet by checking for similar spellings and adding them as new rows.
+    """
+    try:
+        # Read the CSV file
+        with open(input_filename, 'r', encoding='utf-8') as infile:
+            reader = csv.reader(infile)
+            data = list(reader)
+
+        if not data:
+            logger.error(f"Input file '{input_filename}' is empty.")
+            return None
+
+        # Check if there's a header row
+        header = data[0]
+        if 'Info' in header[0]:
+            data_rows = data[1:]
+        else:
+            header = ['Info', 'Role']  # Ensure header is correct
+            data_rows = data
+
+        # Build a list of existing names and roles
+        existing_entries = {(row[0].strip(), row[1].strip()) for row in data_rows if len(row) >= 2}
+        logger.info(f"Existing entries in CSV: {existing_entries}")
+
+        # Extract all names from the narrative
+        names_in_narrative = get_all_names_in_narrative(narrative)
+        logger.info("Names extracted from narrative:")
+        logger.info(names_in_narrative)
+
+        # Collect new rows to add
+        new_rows = []
+
+        # For each name in the CSV, find similar names in the narrative
+        for row in data_rows:
+            if len(row) < 2:
+                logger.warning(f"Skipping row with insufficient columns: {row}")
+                continue
+            original_name = row[0].strip()
+            role = row[1].strip()
+            similar_names = find_similar_names(original_name, names_in_narrative)
+            logger.info(f"Similar names for '{original_name}': {similar_names}")
+
+            # Add similar names as new rows
+            for similar_name in similar_names:
+                # Check if the similar name is already in the CSV
+                entry = (similar_name, role)
+                if entry in existing_entries:
+                    logger.info(f"Entry '{entry}' already exists in CSV. Skipping.")
+                    continue  # Skip if already present
+                new_rows.append([similar_name, role])
+                existing_entries.add(entry)  # Add to existing entries
+                logger.info(f"Added new entry: {entry}")
+
+        # Add new rows to data
+        data_rows.extend(new_rows)
+        logger.info(f"Total new rows added: {len(new_rows)}")
+
+        # Write the updated data to a new CSV file
+        with open(output_filename, 'w', newline='', encoding='utf-8') as outfile:
+            writer = csv.writer(outfile)
+            writer.writerow(header)
+            writer.writerows(data_rows)
+
+        logger.info(f"Spreadsheet '{input_filename}' has been updated and saved as '{output_filename}'.")
+        return header, data_rows  # Return data for GUI display
+    except Exception as e:
+        logger.error(f"Failed to edit spreadsheet '{input_filename}': {e}")
+        return None
+
+def get_all_names_in_narrative(narrative):
+    """
+    Extract all names mentioned in the narrative using the LLM.
+    """
+    system_message = (
+        "Please list all names of people mentioned in the following narrative, one name per line. Do not include any extra text."
+    )
+    names_text = call_llm(narrative, system_message=system_message)
+    logger.info(f"Extracted Names Response:\n{names_text}")
+    names_list = [name.strip() for name in names_text.strip().split('\n') if name.strip()]
+    return names_list
+
+def find_similar_names(name, names_in_narrative):
+    """
+    Find similar names to the given name from a list of names.
+    """
+    similar_names = []
+    for candidate_name in names_in_narrative:
+        if candidate_name.lower() == name.lower():
+            continue  # Skip exact matches
+        system_message = (
+            f"Are '{candidate_name}' and '{name}' different spellings or variations of the same person's name? "
+            "Respond with 'Yes' if they refer to the same person, otherwise 'No'. Provide nothing else."
+        )
+        response = call_llm("", system_message=system_message)
+        logger.info(f"Comparing '{candidate_name}' to '{name}': {response}")
+        if response.strip().lower() == 'yes':
+            similar_names.append(candidate_name)
+    return similar_names
+
+def implement_sheet_gui(narrative, narrative_text_widget):
+    # Ask user to select the CSV file
+    csv_file = filedialog.askopenfilename(title="Select CSV File", filetypes=[("CSV files", "*.csv")])
+    if not csv_file:
+        return
+    redacted_narrative = implement_sheet_return(narrative, csv_file)
+    if redacted_narrative:
+        # Replace the text in the text widget with the redacted narrative
+        narrative_text_widget.delete("1.0", tk.END)
+        narrative_text_widget.insert(tk.END, redacted_narrative)
+        # Save the redacted narrative back to defaultNarritive.txt
+        save_narrative(redacted_narrative)
+        messagebox.showinfo("Success", "Masking implemented in the narrative and saved to 'defaultNarritive.txt'.")
+    else:
+        messagebox.showerror("Error", "Failed to implement masking.")
+
+def implement_sheet_return(narrative, csv_file):
+    """
+    Replace names in the narrative with their corresponding roles from the CSV file.
+    Returns the redacted narrative.
+    """
+    try:
+        name_role_map = {}
+
+        # Read the CSV file and create the name-role map
+        with open(csv_file, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            data = list(reader)
+
+        if not data:
+            logger.error(f"Input file '{csv_file}' is empty.")
+            return None
+
+        # Check if there's a header row
+        header = data[0]
+        if 'Info' in header[0]:
+            data_rows = data[1:]
+        else:
+            data_rows = data
+
+        # Build the name-role map
+        for row in data_rows:
+            if len(row) < 2:
+                logger.warning(f"Skipping row with insufficient columns: {row}")
+                continue
+            name = row[0].strip()
+            role = '[' + row[1].strip() + ']'
+            name_role_map[name] = role
+
+        # Sort names by length in descending order to replace longer names first
+        sorted_names = sorted(name_role_map.keys(), key=len, reverse=True)
+
+        # Replace names with roles in the narrative
+        redacted_narrative = narrative
+        for name in sorted_names:
+            pattern = re.escape(name)
+            redacted_narrative = re.sub(pattern, name_role_map[name], redacted_narrative, flags=re.IGNORECASE)
+
+        return redacted_narrative
+    except Exception as e:
+        logger.error(f"Failed to implement sheet using '{csv_file}': {e}")
+        return None
+
+def main():
+    root = tk.Tk()
+    root.title("LLM Narrative Processor")
+    root.geometry("1000x700")
+
+    # Main PanedWindow
+    main_pane = tk.PanedWindow(root, orient=tk.HORIZONTAL)
+    main_pane.pack(fill=tk.BOTH, expand=1)
+
+    # Left Frame for Narrative
+    left_frame = tk.Frame(main_pane)
+    main_pane.add(left_frame, stretch="always")
+
+    narrative_label = tk.Label(left_frame, text="Narrative:")
+    narrative_label.pack()
+
+    # Narrative Text Area with adjustable size
+    narrative_text = ScrolledText(left_frame, wrap=tk.WORD)
+    narrative_text.pack(fill=tk.BOTH, expand=True)
+
+    # Load default narrative from file
+    try:
+        with open('defaultNarritive.txt', 'r', encoding='utf-8') as f:
+            default_narrative = f.read()
+    except FileNotFoundError:
+        default_narrative = ""
+        logger.error("defaultNarritive.txt not found. Starting with empty narrative.")
+
+    narrative_text.insert(tk.END, default_narrative)
+
+    # Save Button for Narrative
+    save_button = tk.Button(left_frame, text="Save Narrative", command=lambda: save_narrative(narrative_text.get("1.0", tk.END)))
+    save_button.pack(pady=5)
+
+    # Right Frame for CSV Editor
+    right_frame = tk.Frame(main_pane)
+    main_pane.add(right_frame, stretch="always")
+
+    csv_label = tk.Label(right_frame, text="CSV Editor:")
+    csv_label.pack()
+
+    # CSV Treeview
+    csv_tree = ttk.Treeview(right_frame)
+    csv_tree.pack(fill=tk.BOTH, expand=True)
+
+    # Buttons for CSV editing
+    csv_button_frame = tk.Frame(right_frame)
+    csv_button_frame.pack(pady=5)
+
+    add_row_button = tk.Button(csv_button_frame, text="Add Row", command=lambda: add_row(csv_tree))
+    add_row_button.grid(row=0, column=0, padx=5)
+
+    delete_row_button = tk.Button(csv_button_frame, text="Delete Row", command=lambda: delete_row(csv_tree))
+    delete_row_button.grid(row=0, column=1, padx=5)
+
+    # Buttons
+    button_frame = tk.Frame(root)
+    button_frame.pack(pady=10)
+
+    create_sheet_button = tk.Button(button_frame, text="Create Named Entity Sheet", command=lambda: create_spreadsheet_gui(narrative_text.get("1.0", tk.END), csv_tree))
+    create_sheet_button.grid(row=0, column=0, padx=5)
+
+    find_spellings_button = tk.Button(button_frame, text="Find Related Spellings", command=lambda: edit_spreadsheet_gui(narrative_text.get("1.0", tk.END), csv_tree))
+    find_spellings_button.grid(row=0, column=1, padx=5)
+
+    implement_masking_button = tk.Button(button_frame, text="Implement Masking", command=lambda: implement_sheet_gui(narrative_text.get("1.0", tk.END), narrative_text))
+    implement_masking_button.grid(row=0, column=2, padx=5)
+
+    save_csv_button = tk.Button(button_frame, text="Save CSV", command=lambda: save_csv(csv_tree))
+    save_csv_button.grid(row=0, column=3, padx=5)
+
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
